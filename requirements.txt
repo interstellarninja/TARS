@@ -1,0 +1,6 @@
+
+openai==1.25.1
+discord.py==2.4.0
+PyGithub==2.3.0
+python-dotenv==1.0.1
+markdown2==2.5.0
