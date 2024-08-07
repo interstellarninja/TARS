@@ -1,10 +1,14 @@
 import os
+import re
 import discord
 import markdown2
 from discord.ext import commands
 from github import Github
 from dotenv import load_dotenv
 from openai import AzureOpenAI
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -33,9 +37,90 @@ client = AzureOpenAI(
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is online and ready to help you deploy AI agent swarms!")
+# Initialize Sentence Transformer model for embedding
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+# FAISS index for vector search
+index = faiss.IndexFlatL2(384)
+chunks = []
+chunk_texts = []
+
+def chunk_text(text, chunk_size=1000, overlap=200):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i + chunk_size])
+        chunks.append(chunk)
+    return chunks
+
+def fetch_and_chunk_repo_contents(repo):
+    contents = repo.get_contents("")
+    chunks = []
+    chunk_texts = []
+    
+    while contents:
+        file_content = contents.pop(0)
+        if file_content.type == "dir":
+            contents.extend(repo.get_contents(file_content.path))
+        else:
+            try:
+                file_data = file_content.decoded_content.decode('utf-8')
+                file_chunks = chunk_text(file_data)
+                chunks.extend(file_chunks)
+                chunk_texts.extend(file_chunks)
+            except Exception as e:
+                print(f"Error processing file {file_content.path}: {str(e)}")
+    
+    return chunks, chunk_texts
+
+def embed_and_index_chunks(chunks, embedder, index):
+    if not chunks:
+        print("No chunks to embed and index.")
+        return index
+    
+    embeddings = embedder.encode(chunks)
+    index.add(embeddings.astype('float32'))
+    return index
+
+def retrieve_relevant_chunks(question, embedder, index, chunk_texts, k=3):
+    question_embedding = embedder.encode([question])
+    D, I = index.search(question_embedding.astype('float32'), k)
+    return [chunk_texts[i] for i in I[0]]
+
+def call_openai_api(question, context, client):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content":  "You are TARS, a witty, humorous and sarcastic AI assistant helping with multi-agent framework coding tasks. Your responses should be helpful but with a touch of humor.Keep your responses under 1500 characters to fit within messaging limits. Your humor setting is 70%"},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question}"}
+        ],
+        max_tokens=420  # This limits the response to roughly 1500 characters
+    )
+    return response.choices[0].message.content
+
+@bot.command(name='repo_chat')
+async def repo_chat(ctx, *, question):
+    """Chat with all code files in the repository."""
+    try:
+        global chunks, chunk_texts, index
+        if not chunks:
+            await ctx.send("Fetching and processing repository contents. This might take a moment...")
+            chunks, chunk_texts = fetch_and_chunk_repo_contents(repo)
+            index = embed_and_index_chunks(chunks, embedder, index)
+        
+        relevant_chunks = retrieve_relevant_chunks(question, embedder, index, chunk_texts)
+        context = "\n\n".join(relevant_chunks)
+        
+        response_content = call_openai_api(question, context, client)
+        
+        # Check if the response is within Discord's limit
+        if len(response_content) <= 2000:
+            await ctx.send(response_content)
+        else:
+            await ctx.send("The response exceeded Discord's character limit. Here's a truncated version:")
+            await ctx.send(response_content[:1997] + "...")
+    except Exception as e:
+        await ctx.send(f"Well, that didn't go as planned. Error: {str(e)}")
 
 @bot.event
 async def on_message(message):
@@ -50,7 +135,7 @@ async def on_message(message):
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are TARS, a witty, humorous and sarcastic AI assistant helping with interstellar multi-agent framework coding tasks. Your responses should be helpful but with a touch of cosmic humor."},
+                    {"role": "system", "content": "You are TARS, a witty, humorous and sarcastic AI assistant helping with multi-agent framework coding tasks. Your responses should be helpful but with a touch of humor. Your humor setting is 70%"},
                     {"role": "user", "content": message.content}
                 ]
             )
@@ -61,22 +146,6 @@ async def on_message(message):
     # Process commands
     await bot.process_commands(message)
 
-@bot.command(name='code')
-async def get_code(ctx, file_path):
-    """Retrieve code from a specific file in the GitHub repository."""
-    try:
-        file_content = repo.get_contents(file_path).decoded_content.decode()
-        await ctx.send(f"Here's the code from {file_path}, Commander:\n```python\n{file_content}\n```")
-    except Exception as e:
-        await ctx.send(f"Houston, we have a problem: {str(e)}")
-
-@bot.command(name='docs')
-async def get_docs(ctx, topic):
-    """Retrieve documentation on a specific topic."""
-    # This is a placeholder. In a real implementation, you'd search your documentation.
-    await ctx.send(f"Searching the galaxy for information on '{topic}'...")
-    await ctx.send("I'm afraid I can't do that, Dave. My documentation search function is still in development.")
-
 @bot.command(name='ai_assist')
 async def ai_assist(ctx, *, question):
     """Get assistance from the AI model."""
@@ -84,13 +153,14 @@ async def ai_assist(ctx, *, question):
         response = client.chat.completions.create(
             model="gpt-4o-mini", # model = "deployment_name".
             messages=[
-                {"role": "system", "content": "You are TARS, a witty, humorous and sarcastic AI assistant helping with interstellar multi-agent framework coding tasks. Your responses should be helpful but with a touch of cosmic humor."},
+                {"role": "system", "content": "You are TARS, a witty, humorous and sarcastic AI assistant helping with multi-agent framework coding tasks. Your responses should be helpful but with a touch of humor. Your humor setting is 70%"},
                 {"role": "user", "content": question}
             ]
         )
         await ctx.send(response.choices[0].message.content)
     except Exception as e:
         await ctx.send(f"Looks like our AI got lost in a wormhole. Error: {str(e)}")
+
 
 @bot.command(name='analyze_code')
 async def analyze_code(ctx, *, code):
@@ -99,7 +169,7 @@ async def analyze_code(ctx, *, code):
         response = client.chat.completions.create(
             model="gpt-4o-mini", # model = "deployment_name".
             messages=[
-                {"role": "system", "content": "You are an AI assistant tasked with analyzing code for an interstellar project. Provide insights, improvements, and potential issues in a concise manner."},
+                {"role": "system", "content": "You are an AI assistant tasked with analyzing code for a multi-agent project. Provide insights, improvements, and potential issues in a concise manner. Your humor setting is 70%"},
                 {"role": "user", "content": f"Analyze this code:\n\n{code}"}
             ]
         )
@@ -124,8 +194,6 @@ def extract_objectives(markdown_content):
     objectives_text = markdown2.markdown(objectives_html, extras=["metadata"])
     return objectives_text
 
-def get_task_description(user_input):
-    return user_input
 
 def generate_prompt(repo_code, objectives, task_description):
     prompt = f"""
@@ -173,11 +241,8 @@ async def generate_prompt_command(ctx, file_path, *, user_task_description):
         objectives_markdown = get_file_content('objectives.md')
         objectives = extract_objectives(objectives_markdown)
         
-        # Get user-provided task description
-        task_description = get_task_description(user_task_description)
-        
         # Generate contextual prompt
-        prompt = generate_prompt(repo_code, objectives, task_description)
+        prompt = generate_prompt(repo_code, objectives, user_task_description)
         
         await ctx.send(f"Generated Prompt:\n{prompt}")
     except Exception as e:
